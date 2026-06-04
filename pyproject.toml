@@ -1,0 +1,15 @@
+[project]
+name = "comfyui_multi_referencelatent"
+description = "Inject up to 6 reference images into conditioning for FLUX.2 (and other edit models) in a single node, each with its own strength (0 = skip). Built-in VAE encode."
+version = "1.0.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.urls]
+Repository = "https://github.com/lynclee/comfyui_multi_referencelatent"
+
+[tool.comfy]
+PublisherId = "lynclee"
+DisplayName = "Multi Reference Latent"
+Icon = ""
