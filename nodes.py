@@ -1,75 +1,103 @@
 """
-MultiReferenceLatent (comfyui_multi_referencelatent) — 一个节点喂多张参考图(最多 6 张),每张独立 strength 开关。
+comfyui_multi_referencelatent — MultiReferenceLatent
 
-机制对齐 ComfyUI 原生 ReferenceLatent(advanced/conditioning/edit_models):
-  conditioning_set_values(cond, {"reference_latents": [latent_samples]}, append=True)
-原生节点一次只喂一张、要串联多个;本节点把"串联 N 张 + 内置 VAE 编码 + 每张 strength"
-合到一个节点里,适合 flux2 dev / klein 等吃 reference_latents 的编辑模型。
+把若干张参考图(本节点上限 6)一次性挂进同一条 conditioning,供 FLUX.2 dev / klein
+等"读 reference_latents 的编辑模型"使用。等价于把多个原生 ReferenceLatent 串成一串,
+外加内置 VAE 编码与逐图开关,省掉重复连线。
 
-为什么 strength 用乘 latent 实现:reference_latents 是直接拼进 conditioning 的 latent 列表,
-没有独立权重位;按 ComfyUI 社区通行做法,把该图 latent 整体 ×strength 来调它的影响,
-strength=1.0 等于原生行为,0 则该图完全不参与(跳过,不拼)。
+实现只依赖 ComfyUI 公开的两个东西:
+  1. vae.encode(pixels) —— 与内置 VAEEncode 同款,把像素图编码成 latent;
+  2. node_helpers.conditioning_set_values(cond, {"reference_latents": [...]}, append=True)
+     —— 原生 ReferenceLatent 用来把 latent 追加进 conditioning 的唯一入口。
 
-全部 image 输入 optional:
-  - 一张都不接 → conditioning 原样透传(等于纯文生图,不加任何 reference)
-  - 接 N 张且 strength≠0 → 把这 N 张 append 进 reference_latents
+关于 strength 的诚实说明:
+  reference_latents 在 conditioning 里只是一串 latent,模型对每个 latent 没有独立的
+  权重输入。因此"调强度"在 conditioning 这一层能做的只有一件事 —— 缩放该图的 latent
+  数值本身。这是近似:缩放会一并改变 latent 在 VAE 空间的分布,并非纯粹的"影响力旋钮"。
+    - strength == 1.0 : 模型原生行为(最可靠)
+    - strength == 0   : 该图整张跳过,完全不进 conditioning(可靠)
+    - 0 < strength < 1 : 弱化该图(近似,可能伴随轻微的内容呈现变化)
+    - strength > 1     : 放大该图(谨慎,容易过曝/失真)
+
+输入设计:
+  conditioning 是唯一必填项。vae 与全部 image 均为可选。
+    - 一张参考图都不接 → conditioning 原样返回(此时节点是个直通,等于纯文生图);
+    - 接了 N 张有效图 → 逐张编码并追加,得到含 N 个 reference_latents 的 conditioning。
+  好处:同一个静态工作流,接几张就生效几张,不必为不同参考图数量另存工作流,
+  也不必动用 bypass 或改连线。
 """
+
 import node_helpers
 
-MAX_REFS = 6
+# 节点暴露的参考图槽位数量。要扩到更多,改这里即可,UI 与逻辑都按它生成。
+NUM_SLOTS = 6
 
 
 class MultiReferenceLatent:
     @classmethod
     def INPUT_TYPES(cls):
-        optional = {"vae": ("VAE",)}
-        for i in range(1, MAX_REFS + 1):
-            optional[f"image_{i}"] = ("IMAGE",)
-            optional[f"strength_{i}"] = ("FLOAT", {
-                "default": 1.0, "min": -5.0, "max": 10.0, "step": 0.05,
-                "tooltip": f"参考图 {i} 的影响强度。0 = 该图不参与;1.0 = 原生强度;>1 增强;<0 反向参考。",
+        slots = {"vae": ("VAE",)}
+        for n in range(1, NUM_SLOTS + 1):
+            slots[f"image_{n}"] = ("IMAGE",)
+            slots[f"strength_{n}"] = ("FLOAT", {
+                "default": 1.0,
+                "min": 0.0,      # 0 = 跳过该图;不开放负值(负 latent 行为未定义)
+                "max": 5.0,
+                "step": 0.05,
+                "tooltip": (
+                    f"参考图 {n} 的强度。0=跳过该图;1.0=原生强度(最可靠);"
+                    f"<1 弱化、>1 放大均为近似,见节点说明。"
+                ),
             })
         return {
-            "required": {
-                "conditioning": ("CONDITIONING",),
-            },
-            "optional": optional,
+            "required": {"conditioning": ("CONDITIONING",)},
+            "optional": slots,
         }
 
     RETURN_TYPES = ("CONDITIONING",)
-    FUNCTION = "apply"
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "inject_references"
     CATEGORY = "advanced/conditioning/edit_models"
-    DESCRIPTION = ("一个节点喂多张参考图(≤6),每张独立 strength(0=跳过)。"
-                   "用于 flux2 dev/klein 等编辑模型。不接图=纯透传(文生图)。")
+    DESCRIPTION = (
+        "把至多 6 张参考图挂进 conditioning(FLUX.2 dev/klein 等编辑模型)。"
+        "每张图独立 strength,0=跳过;一张不接则直通(纯文生图)。内置 VAE 编码。"
+    )
 
-    def _encode(self, vae, image):
-        # 与 ComfyUI 内置 VAEEncode 一致:取 RGB 三通道编码
-        return vae.encode(image[:, :, :, :3])
+    @staticmethod
+    def _to_reference_latent(vae, image):
+        """像素图 → 参考用 latent。取 RGB 三通道,丢弃可能存在的 alpha。"""
+        rgb = image[..., :3]
+        return vae.encode(rgb)
 
-    def apply(self, conditioning, vae=None, **kwargs):
-        refs = []
-        for i in range(1, MAX_REFS + 1):
-            img = kwargs.get(f"image_{i}")
-            strength = kwargs.get(f"strength_{i}", 1.0)
-            if img is None or strength == 0:
-                continue  # 没接图 / strength=0 → 跳过该图
+    def inject_references(self, conditioning, vae=None, **slots):
+        # 先收集所有"有效"的参考图(接了图且 strength>0),顺序按槽位 1..N。
+        encoded = []
+        for n in range(1, NUM_SLOTS + 1):
+            image = slots.get(f"image_{n}")
+            weight = slots.get(f"strength_{n}", 1.0)
+            if image is None or weight <= 0.0:
+                continue
             if vae is None:
-                raise ValueError("接了参考图但没连 vae —— 请把 VAELoader 连到 vae 输入。")
-            samples = self._encode(vae, img)
-            if strength != 1.0:
-                samples = samples * strength  # 整体缩放调影响强度
-            refs.append(samples)
+                raise ValueError(
+                    f"image_{n} 接了参考图,但 vae 输入是空的。"
+                    f"请把 VAELoader 连到本节点的 vae。"
+                )
+            latent = self._to_reference_latent(vae, image)
+            # strength 即对该图 latent 的整体缩放;weight==1.0 时乘法恒等,不必特判。
+            encoded.append(latent * weight)
 
-        if not refs:
-            return (conditioning,)  # 一张都没有效 → 原样透传(纯文生图)
+        # 没有任何有效参考图 → 节点退化为直通,原样把 conditioning 传出去。
+        if not encoded:
+            return (conditioning,)
 
-        # 逐张 append 进 reference_latents(对齐原生 ReferenceLatent 的 append 语义)
-        out = conditioning
-        for samples in refs:
-            out = node_helpers.conditioning_set_values(
-                out, {"reference_latents": [samples]}, append=True
+        # 逐张追加:每次把一个 latent append 进 reference_latents,
+        # 累积成 [latent_1, latent_2, ...],与原生 ReferenceLatent 的串接语义一致。
+        result = conditioning
+        for latent in encoded:
+            result = node_helpers.conditioning_set_values(
+                result, {"reference_latents": [latent]}, append=True,
             )
-        return (out,)
+        return (result,)
 
 
 NODE_CLASS_MAPPINGS = {

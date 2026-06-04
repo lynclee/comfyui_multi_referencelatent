@@ -9,7 +9,7 @@
 ComfyUI 原生 `ReferenceLatent` 一次只喂一张参考图,要多张就得手动把多个 `ReferenceLatent` 串起来,而且没有逐图强度控制。本节点:
 
 - **一个节点喂多张**(≤6),内部按原生 `reference_latents` append 语义逐张拼接;
-- **每张独立 strength**,`0 = 跳过`,`1.0 = 原生强度`,`>1 增强`,`<0 反向参考`;
+- **每张独立 strength**(范围 `0 ~ 5`),`0 = 跳过`,`1.0 = 原生强度`,`>1 增强`;
 - **内置 VAE 编码**,直接接 `IMAGE`,不用每张图外挂一个 `VAEEncode`;
 - **全 optional**:一张都不接 → conditioning 原样透传(等于纯文生图)。
 
@@ -41,9 +41,20 @@ VAELoader ─►│ vae                          │
 
 把 6 个图槽留着,想用几张就接几张(或者把不想要的那张 `strength` 调 0)。提交时不参与的槽不产生任何 latent,**云端/本地行为完全一致**,无需为不同图数维护多份工作流。
 
-## strength 怎么作用
+## strength 怎么作用(以及它的局限)
 
-`reference_latents` 是直接拼进 conditioning 的 latent 列表,没有独立权重位。本节点按社区通行做法,把该图编码后的 latent **整体 ×strength** 来调它对生成的影响。`1.0` 等于原生 `ReferenceLatent` 行为。
+`reference_latents` 在 conditioning 里只是一串 latent,模型对其中每个 latent **没有独立的权重输入**。所以在 conditioning 这一层,"调强度"唯一能做的就是缩放这张图自己的 latent 数值。这是**近似**,不是干净的"影响力旋钮"——缩放会顺带改变 latent 在 VAE 空间的分布:
+
+- `1.0`:模型原生行为,**最可靠**(等于把这张图原样喂进去);
+- `0`:整张跳过,完全不进 conditioning,**可靠**;
+- `0 < s < 1`:弱化,近似,可能伴随轻微的内容呈现变化;
+- `s > 1`:放大,谨慎用,容易过曝/失真。
+
+把它当"开关 + 微调"用最稳:确定要不要某张图(0 / 1.0),需要时再小幅增减。
+
+## 显存与分辨率
+
+每张参考图都会被 VAE 编码成 latent 并占用模型上下文,**多张高分辨率图会显著增加显存和 token 数**。建议在接入前用上游节点把参考图缩到合理尺寸(例如长边 ≤1024),尤其是同时接 4~6 张时。本节点刻意不内置自动缩放,把分辨率决策留给你的工作流。
 
 ## 许可
 
@@ -64,7 +75,7 @@ A single node that injects **up to 6 reference images** into conditioning, built
 Native `ReferenceLatent` feeds one reference at a time and has no per-image strength. This node:
 
 - **Feeds many in one node** (≤6), chaining them with the native `reference_latents` append semantics;
-- **Per-image strength**: `0 = skip`, `1.0 = native`, `>1` stronger, `<0` negative reference;
+- **Per-image strength** (range `0–5`): `0 = skip`, `1.0 = native`, `>1` stronger;
 - **Built-in VAE encode** — wire `IMAGE` directly, no per-image `VAEEncode`;
 - **All optional** — connect nothing and conditioning passes through unchanged (plain text-to-image).
 
@@ -80,9 +91,24 @@ Native `ReferenceLatent` feeds one reference at a time and has no per-image stre
 - `image_1..image_6` (optional): reference images.
 - `strength_1..strength_6`: per-image strength; **leave 0 to disable that slot**.
 
-## How strength works
+## One workflow, 0–6 images
 
-`reference_latents` has no separate weight field, so the encoded latent of each image is scaled by `strength`. `1.0` equals native `ReferenceLatent` behavior.
+Keep all 6 slots; wire as many as you need (or set an unwanted image's `strength` to 0). Disabled slots produce no latent at all, so behavior is identical locally and on any backend — no need to maintain separate workflows per image count.
+
+## How strength works (and its limits)
+
+`reference_latents` is just a list of latents in the conditioning; the model has **no per-latent weight input**. So at the conditioning level the only thing "strength" can do is scale that image's own latent values. This is an **approximation**, not a clean influence knob — scaling also shifts the latent's distribution in VAE space:
+
+- `1.0`: native behavior, **most reliable** (feeds the image as-is);
+- `0`: the image is skipped entirely, **reliable**;
+- `0 < s < 1`: weaker, approximate, may slightly alter how the reference reads;
+- `s > 1`: stronger, use sparingly — prone to over-exposure / artifacts.
+
+Treat it as a switch plus fine-tune: decide whether an image is in (0 / 1.0), then nudge if needed.
+
+## VRAM & resolution
+
+Every reference image is VAE-encoded into a latent that occupies model context, so **several high-resolution images noticeably increase VRAM and token count**. Resize references upstream to a sane size (e.g. long edge ≤1024) before wiring them in, especially with 4–6 images at once. This node deliberately ships no auto-resize — the resolution decision stays in your workflow.
 
 ## License
 
