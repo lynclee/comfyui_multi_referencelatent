@@ -2,13 +2,13 @@
 
 > 中文 | [English](#english)
 
-把**最多 6 张参考图**一次性注入 conditioning 的单节点,专为 **FLUX.2 dev / klein** 这类吃 `reference_latents` 的图像编辑模型设计。每张图有独立的 `strength`,**`strength = 0` 就跳过那张图** —— 于是一个静态工作流就能覆盖 0~6 张参考图,不用 bypass、不用动态改线、不用为不同图数准备多个工作流。
+把**最多 6 张参考图**一次性注入 conditioning 的单节点,专为 **FLUX.2 dev / klein** 这类吃 `reference_latents` 的图像编辑模型设计。每张图有独立的 `strength`,**`strength = 0` 就跳过那张图** —— 于是一个静态工作流就能覆盖 0~6 张参考图,不用 bypass、不用动态改线、不用为不同图数准备多个工作流。程序化提交还可用 `reference_list` 文本(图数=行数,无占位图)。
 
 ## 它解决什么
 
 ComfyUI 原生 `ReferenceLatent` 一次只喂一张参考图,要多张就得手动把多个 `ReferenceLatent` 串起来,而且没有逐图强度控制。本节点:
 
-- **一个节点喂多张**(≤6),内部按原生 `reference_latents` append 语义逐张拼接;
+- **一个节点喂多张**(≤6 socket,或 reference_list 不限),内部按原生 `reference_latents` append 语义逐张拼接;
 - **每张独立 strength**(范围 `0 ~ 5`),`0 = 跳过`,`1.0 = 原生强度`,`>1 增强`;
 - **内置 VAE 编码**,直接接 `IMAGE`,不用每张图外挂一个 `VAEEncode`;
 - **全 optional**:一张都不接 → conditioning 原样透传(等于纯文生图)。
@@ -40,6 +40,23 @@ VAELoader ─►│ vae                          │
 ## 一个工作流覆盖 0~6 图
 
 把 6 个图槽留着,想用几张就接几张(或者把不想要的那张 `strength` 调 0)。提交时不参与的槽不产生任何 latent,**云端/本地行为完全一致**,无需为不同图数维护多份工作流。
+
+## 程序化喂图:`reference_list`(无占位图,图数=行数)
+
+画布手动用 `image_N` socket;但**程序化/API 提交**时,socket 会留下"空槽"(要么占位图、要么动态改线)。为此节点提供另一条路 —— `reference_list` 多行文本:
+
+```
+2.0 iVBORw0KGgoAAAANS...        ← 第 1 张,strength=2.0
+iVBORw0KGgoAAAANS...            ← 第 2 张,strength 省略=1.0
+0.5 data:image/png;base64,iVBOR... ← 第 3 张,支持 data URI 前缀
+```
+
+- **每行一张图**,格式 `[strength ]<base64>`,strength 可省(=1.0);
+- **图数 = 非空行数**,完全由你填的文本决定 —— graph 结构恒定,**没有空槽、没有占位图、没有动态改线、没有多份 JSON**;
+- 空行忽略,`strength=0` 的行跳过;
+- 可与 `image_N` socket 同时用(socket 在前)。
+
+后端只需把 N 张图拼成 N 行塞进这个字段,一个静态工作流适配任意张数。这就是"**静态的是 graph,动态的是数据**"。
 
 ## strength 怎么作用(以及它的局限)
 
@@ -79,13 +96,13 @@ MIT。基于 ComfyUI 公开的原生 `ReferenceLatent` 机制独立实现。
 
 > [中文](#comfyui-multi-reference-latent) | English
 
-A single node that injects **up to 6 reference images** into conditioning, built for **FLUX.2 dev / klein** and other edit models that consume `reference_latents`. Each image has its own `strength`, and **`strength = 0` skips that image** — so one static workflow covers 0–6 references without bypass, rewiring, or multiple workflows.
+A single node that injects **up to 6 reference images** into conditioning, built for **FLUX.2 dev / klein** and other edit models that consume `reference_latents`. Each image has its own `strength`, and **`strength = 0` skips that image** — so one static workflow covers 0–6 references without bypass, rewiring, or multiple workflows. For programmatic submission there is also a `reference_list` text field (image count = number of lines, no placeholder images).
 
 ## What it solves
 
 Native `ReferenceLatent` feeds one reference at a time and has no per-image strength. This node:
 
-- **Feeds many in one node** (≤6), chaining them with the native `reference_latents` append semantics;
+- **Feeds many in one node** (≤6 sockets, or unlimited via reference_list), chaining them with the native `reference_latents` append semantics;
 - **Per-image strength** (range `0–5`): `0 = skip`, `1.0 = native`, `>1` stronger;
 - **Built-in VAE encode** — wire `IMAGE` directly, no per-image `VAEEncode`;
 - **All optional** — connect nothing and conditioning passes through unchanged (plain text-to-image).
@@ -105,6 +122,23 @@ Native `ReferenceLatent` feeds one reference at a time and has no per-image stre
 ## One workflow, 0–6 images
 
 Keep all 6 slots; wire as many as you need (or set an unwanted image's `strength` to 0). Disabled slots produce no latent at all, so behavior is identical locally and on any backend — no need to maintain separate workflows per image count.
+
+## Programmatic input: `reference_list` (no placeholder images)
+
+`image_N` sockets are for the canvas; but for **programmatic / API submission**, sockets leave "empty slots" (needing placeholder images or graph rewiring). So the node offers another path — the `reference_list` multiline text:
+
+```
+2.0 iVBORw0KGgoAAAANS...        ← image 1, strength 2.0
+iVBORw0KGgoAAAANS...            ← image 2, strength omitted = 1.0
+0.5 data:image/png;base64,iVBOR... ← image 3, data URI prefix supported
+```
+
+- **one image per line**, format `[strength ]<base64>`, strength optional (=1.0);
+- **image count = number of non-empty lines**, fully data-driven — the graph structure is fixed: **no empty slots, no placeholder images, no rewiring, no multiple JSONs**;
+- blank lines ignored, lines with `strength=0` skipped;
+- works alongside `image_N` sockets (sockets first).
+
+Your backend just joins N images into N lines and fills this field; one static workflow adapts to any count. The graph stays static, the data drives the image count.
 
 ## How strength works (and its limits)
 

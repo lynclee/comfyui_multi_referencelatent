@@ -1,9 +1,15 @@
 """
 comfyui_multi_referencelatent — MultiReferenceLatent
 
-把若干张参考图(本节点上限 6)一次性挂进同一条 conditioning,供 FLUX.2 dev / klein
+把若干张参考图一次性挂进同一条 conditioning,供 FLUX.2 dev / klein
 等"读 reference_latents 的编辑模型"使用。等价于把多个原生 ReferenceLatent 串成一串,
-外加内置 VAE 编码与逐图开关,省掉重复连线。
+外加内置 VAE 编码与逐图强度,省掉重复连线。
+
+两种喂图方式,可单用也可并用:
+  A) image_1..6 这些 IMAGE socket —— 画布手动用,连 LoadImage、能看预览。
+  B) reference_list 多行文本(每行一张图的 base64) —— 程序化/后端用。
+     图数 = 文本有几行,完全由数据决定,graph 结构恒定,无"空槽"、无占位图、无动态改线。
+     一个静态工作流即可适配任意张数(0..N),后端只往这个文本框填几行就喂几张。
 
 实现只依赖 ComfyUI 公开的两个东西:
   1. vae.encode(pixels) —— 与内置 VAEEncode 同款,把像素图编码成 latent;
@@ -19,17 +25,12 @@ comfyui_multi_referencelatent — MultiReferenceLatent
     - 0 < strength < 1 : 弱化该图(近似,可能伴随轻微的内容呈现变化)
     - strength > 1     : 放大该图(谨慎,容易过曝/失真)
 
-输入设计:
-  conditioning 是唯一必填项。vae 与全部 image 均为可选。
-    - 一张参考图都不接 → conditioning 原样返回(此时节点是个直通,等于纯文生图);
-    - 接了 N 张有效图 → 逐张编码并追加,得到含 N 个 reference_latents 的 conditioning。
-  好处:同一个静态工作流,接几张就生效几张,不必为不同参考图数量另存工作流,
-  也不必动用 bypass 或改连线。
+conditioning 是唯一必填项;一张参考图都没有时,节点原样返回(直通,等于纯文生图)。
 """
 
 import node_helpers
 
-# 节点暴露的参考图槽位数量。要扩到更多,改这里即可,UI 与逻辑都按它生成。
+# image socket 的槽位数量(画布手动用)。reference_list 文本方式不受这个上限约束。
 NUM_SLOTS = 6
 
 
@@ -49,6 +50,15 @@ class MultiReferenceLatent:
                     f"<1 弱化、>1 放大均为近似,见节点说明。"
                 ),
             })
+        slots["reference_list"] = ("STRING", {
+            "multiline": True,
+            "default": "",
+            "tooltip": (
+                "程序化/后端用:每行一张参考图,格式「strength base64」(strength 可省=1.0),"
+                "如「1.0 iVBOR...」或直接「iVBOR...」。图数=非空行数,无槽、无占位图。"
+                "可与上面的 image_N socket 同时用(socket 在前)。支持 data:image/...;base64, 前缀。"
+            ),
+        })
         return {
             "required": {
                 "conditioning": ("CONDITIONING",),
@@ -70,7 +80,8 @@ class MultiReferenceLatent:
     FUNCTION = "inject_references"
     CATEGORY = "advanced/conditioning/edit_models"
     DESCRIPTION = (
-        "把至多 6 张参考图挂进 conditioning(FLUX.2 dev/klein 等编辑模型)。"
+        "把多张参考图挂进 conditioning(FLUX.2 dev/klein 等编辑模型)。"
+        "两种喂图:image_N socket(画布)或 reference_list 多行 base64(程序化,图数=行数,无占位图)。"
         "每张图独立 strength,0=跳过;一张不接则直通(纯文生图)。内置 VAE 编码。"
     )
 
@@ -80,25 +91,77 @@ class MultiReferenceLatent:
         rgb = image[..., :3]
         return vae.encode(rgb)
 
-    def inject_references(self, conditioning, strength_mode="manual", vae=None, **slots):
-        # 先收集"有效"的参考图(接了图且 strength>0),按槽位序 1..N,暂不编码。
-        # 推迟编码是为了让 normalize 能先看到全部权重、算完总和再缩放,只编码一次。
-        active = []  # [(image, weight), ...]
+    @staticmethod
+    def _parse_list_line(line):
+        """
+        解析 reference_list 的一行 → (weight, base64) 或 None(空行)。
+        行格式:「strength base64」或「base64」。strength 缺省为 1.0。
+        base64 字符集不含空格,所以用首个空白切一刀:第一段能转 float 就是 strength。
+        """
+        s = line.strip()
+        if not s:
+            return None
+        head, _, tail = s.partition(" ")
+        if tail:
+            try:
+                return (float(head), tail.strip())
+            except ValueError:
+                pass  # 第一段不是数 → 整行都是 base64
+        return (1.0, s)
+
+    @staticmethod
+    def _b64_to_image(b64):
+        """base64(可带 data URI 前缀)→ ComfyUI IMAGE 张量 [1, H, W, 3], float 0..1。"""
+        import base64 as _b64m
+        import io as _io
+        import numpy as _np
+        import torch as _torch
+        from PIL import Image as _Image
+
+        s = b64.strip()
+        if s.startswith("data:"):
+            s = s.split(",", 1)[1] if "," in s else s
+        raw = _b64m.b64decode(s)
+        pil = _Image.open(_io.BytesIO(raw)).convert("RGB")
+        arr = _np.asarray(pil, dtype=_np.float32) / 255.0
+        return _torch.from_numpy(arr)[None, ]
+
+    def inject_references(self, conditioning, strength_mode="manual",
+                          vae=None, reference_list="", **slots):
+        # 统一收集"有效"参考图为 (image_tensor, weight),先不编码。
+        # 推迟编码:让 normalize 能先看到全部权重、算完总和再缩放,且只编码一次。
+        active = []  # [(image_tensor, weight), ...]
+
+        # 来源 A:image_N socket(画布手动),按槽位序 1..N。
         for n in range(1, NUM_SLOTS + 1):
             image = slots.get(f"image_{n}")
             weight = slots.get(f"strength_{n}", 1.0)
             if image is None or weight <= 0.0:
-                continue  # 没接图 / strength=0 → 跳过(两种模式下都成立)
-            if vae is None:
+                continue  # 没接图 / strength=0 → 跳过
+            active.append((image, weight))
+
+        # 来源 B:reference_list 多行 base64(程序化),图数 = 非空行数。
+        for lineno, line in enumerate(reference_list.splitlines(), 1):
+            parsed = self._parse_list_line(line)
+            if parsed is None:
+                continue  # 空行
+            weight, b64 = parsed
+            if weight <= 0.0:
+                continue  # strength=0 → 跳过该行
+            try:
+                image = self._b64_to_image(b64)
+            except Exception as e:
                 raise ValueError(
-                    f"image_{n} 接了参考图,但 vae 输入是空的。"
-                    f"请把 VAELoader 连到本节点的 vae。"
+                    f"reference_list 第 {lineno} 行 base64 解码失败:{e}"
                 )
             active.append((image, weight))
 
         # 没有任何有效参考图 → 节点退化为直通,原样把 conditioning 传出去。
         if not active:
             return (conditioning,)
+
+        if vae is None:
+            raise ValueError("有参考图但 vae 输入是空的。请把 VAELoader 连到本节点的 vae。")
 
         # normalize:按总和把各权重归一化到和=1,保留相对比例;全相等时即均分 1/N。
         # 总和必为正(只有 weight>0 的图才进 active),不会除零。
