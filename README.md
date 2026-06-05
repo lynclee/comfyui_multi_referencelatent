@@ -52,6 +52,17 @@ VAELoader ─►│ vae                          │
 
 把它当"开关 + 微调"用最稳:确定要不要某张图(0 / 1.0),需要时再小幅增减。
 
+### strength_mode:手动 / 自动归一化
+
+节点上有个 `strength_mode` 开关:
+
+- `manual`(默认):每张图各用各自的 strength,行为同上;
+- `normalize`:把所有有效图的 strength **按总和归一化(和=1)**,保留你设的相对比例。例如三张设 `2/1/1` → `0.5/0.25/0.25`;全设 `1` → `0.333/0.333/0.333`(即自动均分)。接几张就自动分几份,不必手动改。
+
+两种模式下 `strength=0` 都仍表示**跳过该图**,归一化只在剩下的有效图之间分配。
+
+> 提醒:归一化让"总权重"恒为 1,但因为 strength 本质是缩放 latent(见上),图越多每张被压得越低,可能整体发灰。`normalize` 适合"懒得逐个填、要按比例自动分"的场景;追求单图保真时用 `manual` + `1.0`。
+
 ## 显存与分辨率
 
 每张参考图都会被 VAE 编码成 latent 并占用模型上下文,**多张高分辨率图会显著增加显存和 token 数**。建议在接入前用上游节点把参考图缩到合理尺寸(例如长边 ≤1024),尤其是同时接 4~6 张时。本节点刻意不内置自动缩放,把分辨率决策留给你的工作流。
@@ -105,6 +116,17 @@ Keep all 6 slots; wire as many as you need (or set an unwanted image's `strength
 - `s > 1`: stronger, use sparingly — prone to over-exposure / artifacts.
 
 Treat it as a switch plus fine-tune: decide whether an image is in (0 / 1.0), then nudge if needed.
+
+### strength_mode: manual / auto-normalize
+
+The node has a `strength_mode` switch:
+
+- `manual` (default): each image uses its own strength, as above;
+- `normalize`: all active strengths are **normalized to sum to 1**, keeping your relative ratios. E.g. three images at `2/1/1` → `0.5/0.25/0.25`; all `1` → `0.333/0.333/0.333` (auto-equal). Wire any number of images and they auto-split.
+
+In both modes `strength=0` still **skips** that image; normalization only distributes across the remaining active ones.
+
+> Note: normalizing keeps total weight at 1, but since strength scales the latent (see above), more images means each is pushed lower and the result may turn flat/grey. Use `normalize` when you want hands-off proportional splitting; use `manual` + `1.0` when single-image fidelity matters.
 
 ## VRAM & resolution
 

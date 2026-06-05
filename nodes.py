@@ -50,7 +50,18 @@ class MultiReferenceLatent:
                 ),
             })
         return {
-            "required": {"conditioning": ("CONDITIONING",)},
+            "required": {
+                "conditioning": ("CONDITIONING",),
+                "strength_mode": (["manual", "normalize"], {
+                    "default": "manual",
+                    "tooltip": (
+                        "manual:每张图各用各自的 strength。"
+                        "normalize:把所有有效图的 strength 按总和归一化(和=1),"
+                        "保留相对比例(2/1/1→0.5/0.25/0.25),全相等时即自动均分。"
+                        "两种模式下 strength=0 都表示跳过该图。"
+                    ),
+                }),
+            },
             "optional": slots,
         }
 
@@ -69,33 +80,39 @@ class MultiReferenceLatent:
         rgb = image[..., :3]
         return vae.encode(rgb)
 
-    def inject_references(self, conditioning, vae=None, **slots):
-        # 先收集所有"有效"的参考图(接了图且 strength>0),顺序按槽位 1..N。
-        encoded = []
+    def inject_references(self, conditioning, strength_mode="manual", vae=None, **slots):
+        # 先收集"有效"的参考图(接了图且 strength>0),按槽位序 1..N,暂不编码。
+        # 推迟编码是为了让 normalize 能先看到全部权重、算完总和再缩放,只编码一次。
+        active = []  # [(image, weight), ...]
         for n in range(1, NUM_SLOTS + 1):
             image = slots.get(f"image_{n}")
             weight = slots.get(f"strength_{n}", 1.0)
             if image is None or weight <= 0.0:
-                continue
+                continue  # 没接图 / strength=0 → 跳过(两种模式下都成立)
             if vae is None:
                 raise ValueError(
                     f"image_{n} 接了参考图,但 vae 输入是空的。"
                     f"请把 VAELoader 连到本节点的 vae。"
                 )
-            latent = self._to_reference_latent(vae, image)
-            # strength 即对该图 latent 的整体缩放;weight==1.0 时乘法恒等,不必特判。
-            encoded.append(latent * weight)
+            active.append((image, weight))
 
         # 没有任何有效参考图 → 节点退化为直通,原样把 conditioning 传出去。
-        if not encoded:
+        if not active:
             return (conditioning,)
 
-        # 逐张追加:每次把一个 latent append 进 reference_latents,
+        # normalize:按总和把各权重归一化到和=1,保留相对比例;全相等时即均分 1/N。
+        # 总和必为正(只有 weight>0 的图才进 active),不会除零。
+        if strength_mode == "normalize":
+            total = sum(weight for _, weight in active)
+            active = [(image, weight / total) for image, weight in active]
+
+        # 逐张编码并按权重缩放,append 进 reference_latents,
         # 累积成 [latent_1, latent_2, ...],与原生 ReferenceLatent 的串接语义一致。
         result = conditioning
-        for latent in encoded:
+        for image, weight in active:
+            latent = self._to_reference_latent(vae, image)
             result = node_helpers.conditioning_set_values(
-                result, {"reference_latents": [latent]}, append=True,
+                result, {"reference_latents": [latent * weight]}, append=True,
             )
         return (result,)
 
